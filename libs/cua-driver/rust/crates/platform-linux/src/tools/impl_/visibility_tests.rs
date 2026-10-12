@@ -90,6 +90,7 @@ fn overlays_name_the_follow_up_call_per_dialog_and_popup() {
         })],
         covers_window: true,
         window_rect: Some((0, 0, 800, 600)),
+        ..Default::default()
     };
     let note = overlays.follow_up(5).unwrap();
     assert!(
@@ -122,6 +123,7 @@ fn a_cross_process_dialog_names_its_real_owning_pid_in_the_follow_up() {
         popups: vec![],
         covers_window: false,
         window_rect: Some((0, 0, 800, 600)),
+        ..Default::default()
     };
     let note = overlays.follow_up(5).unwrap();
     assert!(
@@ -132,4 +134,57 @@ fn a_cross_process_dialog_names_its_real_owning_pid_in_the_follow_up() {
         note.contains("get_window_state(pid=5, window_id=90)"),
         "{note}"
     );
+}
+
+#[test]
+fn nested_untitled_modal_is_observed_and_is_the_follow_up_target() {
+    fn observed(
+        id: u64,
+        title: &str,
+        parent: Option<u64>,
+        modal: bool,
+        visible: bool,
+    ) -> ObservedWindow {
+        ObservedWindow {
+            window: crate::x11::WindowInfo {
+                xid: id,
+                pid: Some(5),
+                title: title.into(),
+                app_name: "Mousepad".into(),
+                is_on_screen: visible,
+                z_index: Some(id as usize),
+                x: 10,
+                y: 20,
+                width: 400,
+                height: 300,
+            },
+            transient_for: parent,
+            modal,
+        }
+    }
+    let windows = vec![
+        observed(1, "Mousepad", None, false, true),
+        observed(2, "Save As", Some(1), true, true),
+        observed(3, "", Some(2), true, true),
+        observed(4, "Hidden", Some(3), true, false),
+    ];
+    let main = overlays_from_snapshot(5, 1, &windows, Some(3), Some((0, 0, 800, 600)));
+    assert_eq!(main.windows.len(), 3);
+    assert_eq!(main.active_modal, Some(3));
+    assert_eq!(main.windows[2]["title"], "");
+    assert_eq!(main.windows[2]["transient_for"], 2);
+    assert_eq!(main.windows[2]["active_modal"], true);
+    assert_eq!(main.dialogs.len(), 2);
+    let note = main.follow_up(5).unwrap();
+    assert!(
+        note.contains("get_window_state(pid=5, window_id=3)"),
+        "{note}"
+    );
+    assert!(!note.contains("window_id=2)"), "{note}");
+    let chooser = overlays_from_snapshot(5, 2, &windows, Some(3), None);
+    assert_eq!(chooser.dialogs.len(), 1);
+    assert_eq!(chooser.dialogs[0]["window_id"], 3);
+    let modal = overlays_from_snapshot(5, 3, &windows, Some(3), None);
+    assert!(modal.dialogs.is_empty());
+    assert!(modal.follow_up(5).is_none());
 }

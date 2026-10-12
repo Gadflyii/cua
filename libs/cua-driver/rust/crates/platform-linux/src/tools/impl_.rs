@@ -591,8 +591,7 @@ impl Tool for ListWindowsTool {
                 }
             ));
         }
-        let structured =
-            json!({ "windows": windows.iter().map(window_record_json).collect::<Vec<_>>() });
+        let structured = json!({ "windows": observed_window_records(&windows) });
         ToolResult::text(lines.join("\n")).with_structured(structured)
     }
 }
@@ -870,12 +869,12 @@ fn framed_elements_first(elements: Vec<serde_json::Value>) -> Vec<serde_json::Va
     framed.into_iter().chain(frameless).collect()
 }
 
-/// Same-pid windows mapped over a target window: transient dialogs (with
-/// their modality) and override-redirect popups, plus whether any of them
-/// overlaps the target's rectangle (then its own drawable is not what the
-/// user sees).
+/// Visible application windows, owned dialogs and mapped popups.
+/// The focused modal is the next observation target.
 #[derive(Default)]
 struct WindowOverlays {
+    windows: Vec<Value>,
+    active_modal: Option<u64>,
     dialogs: Vec<serde_json::Value>,
     popups: Vec<serde_json::Value>,
     covers_window: bool,
@@ -887,6 +886,12 @@ impl WindowOverlays {
     fn follow_up(&self, pid: u32) -> Option<String> {
         let mut parts = Vec::new();
         for dialog in &self.dialogs {
+            if self
+                .active_modal
+                .is_some_and(|active| dialog["window_id"].as_u64() != Some(active))
+            {
+                continue;
+            }
             let id = dialog["window_id"].as_u64().unwrap_or(0);
             let owning_pid = dialog.get("owning_pid").and_then(|v| v.as_u64());
             parts.push(format!(
@@ -930,57 +935,114 @@ fn rects_intersect(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> bool {
         && a.1 + a.3 as i32 > b.1
 }
 
-fn window_overlays(pid: u32, xid: u64) -> WindowOverlays {
+struct ObservedWindow {
+    window: crate::x11::WindowInfo,
+    transient_for: Option<u64>,
+    modal: bool,
+}
+
+fn observe_x11_windows(windows: Vec<crate::x11::WindowInfo>) -> Vec<ObservedWindow> {
+    windows
+        .into_iter()
+        .map(|window| ObservedWindow {
+            transient_for: crate::x11::transient_for(window.xid),
+            modal: crate::x11::window_is_modal(window.xid),
+            window,
+        })
+        .collect()
+}
+
+fn focused_observation_window(windows: &[ObservedWindow]) -> Option<u64> {
+    let ids: Vec<_> = windows.iter().map(|w| w.window.xid).collect();
+    crate::x11::focused_window_among(&ids).or_else(crate::x11::active_window)
+}
+
+fn observed_window_record(w: &ObservedWindow, focused: Option<u64>) -> Value {
+    let mut record = window_record_json(&w.window);
+    record["transient_for"] = json!(w.transient_for);
+    record["modal"] = json!(w.modal);
+    record["is_active"] = json!(focused == Some(w.window.xid));
+    record["active_modal"] = json!(w.modal && focused == Some(w.window.xid));
+    record
+}
+
+fn observed_window_records(windows: &[crate::x11::WindowInfo]) -> Vec<Value> {
+    if crate::wayland::is_wayland() {
+        return windows.iter().map(window_record_json).collect();
+    }
+    let snapshot = observe_x11_windows(windows.to_vec());
+    let focused = focused_observation_window(&snapshot);
+    snapshot
+        .iter()
+        .map(|w| observed_window_record(w, focused))
+        .collect()
+}
+
+fn transient_descends_from(windows: &[ObservedWindow], window: u64, ancestor: u64) -> bool {
+    let mut current = window;
+    for _ in 0..windows.len() {
+        let Some(parent) = windows
+            .iter()
+            .find(|w| w.window.xid == current)
+            .and_then(|w| w.transient_for)
+        else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn overlays_from_snapshot(
+    pid: u32,
+    xid: u64,
+    snapshot: &[ObservedWindow],
+    focused: Option<u64>,
+    window_rect: Option<(i32, i32, u32, u32)>,
+) -> WindowOverlays {
     let mut out = WindowOverlays {
-        window_rect: crate::x11::window_info(xid).map(|w| (w.x, w.y, w.width, w.height)),
+        window_rect,
         ..Default::default()
     };
+    for observed in snapshot {
+        let w = &observed.window;
+        if !w.is_on_screen || w.width == 0 || w.height == 0 {
+            continue;
+        }
+        let record = observed_window_record(observed, focused);
+        if record["active_modal"] == true {
+            out.active_modal = Some(w.xid);
+        }
+        out.windows.push(record.clone());
+        if w.xid == xid || !transient_descends_from(snapshot, w.xid, xid) {
+            continue;
+        }
+        let mut dialog = record;
+        if w.pid != Some(pid) {
+            dialog["owning_pid"] = json!(w.pid);
+        }
+        out.covers_window |=
+            window_rect.is_some_and(|rect| rects_intersect(rect, (w.x, w.y, w.width, w.height)));
+        out.dialogs.push(dialog);
+    }
+    out
+}
+
+fn window_overlays(pid: u32, xid: u64) -> WindowOverlays {
+    let mut windows = crate::x11::list_windows(Some(pid));
+    windows.extend(crate::x11::list_cross_pid_transient_windows(pid));
+    let snapshot = observe_x11_windows(windows);
+    let focused = focused_observation_window(&snapshot);
+    let rect = crate::x11::window_info(xid).map(|w| (w.x, w.y, w.width, w.height));
+    let mut out = overlays_from_snapshot(pid, xid, &snapshot, focused, rect);
     let over = |rect: (i32, i32, u32, u32)| {
         out.window_rect
             .is_some_and(|target| rects_intersect(rect, target))
     };
-    let mut covers = false;
-    for window in crate::x11::list_windows(Some(pid)) {
-        if window.xid == xid || !window.is_on_screen || window.width == 0 || window.height == 0 {
-            continue;
-        }
-        let Some(owner) = crate::x11::transient_for(window.xid) else {
-            continue;
-        };
-        covers |= over((window.x, window.y, window.width, window.height));
-        out.dialogs.push(json!({
-            "window_id": window.xid,
-            "title": window.title,
-            "transient_for": owner,
-            "modal": crate::x11::window_is_modal(window.xid),
-            "bounds": { "x": window.x, "y": window.y, "width": window.width, "height": window.height },
-        }));
-    }
-    // A dialog/plugin window can legitimately run as a DIFFERENT process than
-    // the application it belongs to (GIMP's separate-process export dialogs,
-    // LibreOffice's Document Recovery dialog under a distinct soffice.bin).
-    // Exact-pid matching above would make such a window invisible even though
-    // it is unambiguously this application's own popup. WM_TRANSIENT_FOR
-    // resolving to one of pid's own windows is the correlation signal (see
-    // `list_cross_pid_transient_windows`); such entries are tagged with
-    // `owning_pid` so callers can tell it apart from a same-process dialog.
-    for window in crate::x11::list_cross_pid_transient_windows(pid) {
-        if window.xid == xid || !window.is_on_screen || window.width == 0 || window.height == 0 {
-            continue;
-        }
-        let Some(owner) = crate::x11::transient_for(window.xid) else {
-            continue;
-        };
-        covers |= over((window.x, window.y, window.width, window.height));
-        out.dialogs.push(json!({
-            "window_id": window.xid,
-            "title": window.title,
-            "transient_for": owner,
-            "modal": crate::x11::window_is_modal(window.xid),
-            "bounds": { "x": window.x, "y": window.y, "width": window.width, "height": window.height },
-            "owning_pid": window.pid,
-        }));
-    }
+    let mut covers = out.covers_window;
     for popup in crate::input::mapped_popup_windows() {
         if popup.window == xid || popup.pid.is_some_and(|owner| owner != pid) {
             continue;
@@ -1733,6 +1795,8 @@ impl Tool for GetWindowStateTool {
                 }
                 // Transient dialogs and popups of this pid that are open over
                 // the window, each with the call that targets it.
+                structured["windows"] = json!(overlays.windows);
+                structured["active_modal_window_id"] = json!(overlays.active_modal);
                 if !overlays.dialogs.is_empty() {
                     structured["dialogs"] = json!(overlays.dialogs);
                 }
@@ -12496,7 +12560,7 @@ impl Tool for GetDesktopStateTool {
                     "scale_factor": scale_factor,
                     "frame_scale": frame_scale,
                     "screenshot_mime_type": "image/png",
-                    "windows": windows.iter().map(window_record_json).collect::<Vec<_>>(),
+                    "windows": observed_window_records(&windows),
                     "capture_id": capture_id,
                     "agent_overlay_capture": overlay_capture,
                 });

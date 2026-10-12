@@ -107,9 +107,6 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
         }
 
         let title = get_window_title(&conn, xid).unwrap_or_default();
-        if title.trim().is_empty() {
-            continue;
-        }
         let app_name = get_window_class(&conn, xid)
             .map(|(instance, class)| if class.is_empty() { instance } else { class })
             .unwrap_or_default();
