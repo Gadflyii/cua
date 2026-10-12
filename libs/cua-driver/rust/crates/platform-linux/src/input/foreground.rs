@@ -355,6 +355,7 @@ struct X11 {
     root: Window,
     net_active_window: u32,
     net_wm_pid: u32,
+    wm_transient_for: u32,
     resource_id_mask: u32,
     /// The window manager's `_NET_SUPPORTING_WM_CHECK` window, when one is
     /// advertised: any window sharing its X client base belongs to the WM.
@@ -366,6 +367,24 @@ struct X11 {
 /// `resource_id_mask`.
 fn same_x11_client(a: Window, b: Window, resource_id_mask: u32) -> bool {
     a & !resource_id_mask == b & !resource_id_mask
+}
+
+/// Popups may keep their owner's EWMH activation while holding input focus.
+fn owned_popup(
+    override_redirect: bool,
+    transient_for: Option<Window>,
+    target: Window,
+    active: Window,
+    resource_id_mask: u32,
+    target_pid: Option<u32>,
+    active_pid: Option<u32>,
+) -> bool {
+    active != 0
+        && active != target
+        && (override_redirect || transient_for == Some(active))
+        && (transient_for == Some(active)
+            || same_x11_client(target, active, resource_id_mask)
+            || target_pid.is_some_and(|pid| active_pid == Some(pid)))
 }
 
 impl X11 {
@@ -380,6 +399,7 @@ impl X11 {
             .reply()?
             .atom;
         let net_wm_pid = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+        let wm_transient_for = conn.intern_atom(false, b"WM_TRANSIENT_FOR")?.reply()?.atom;
         let wm_check = conn
             .intern_atom(false, b"_NET_SUPPORTING_WM_CHECK")?
             .reply()?
@@ -395,6 +415,7 @@ impl X11 {
             root,
             net_active_window,
             net_wm_pid,
+            wm_transient_for,
             resource_id_mask,
             wm_check_window,
         })
@@ -435,6 +456,36 @@ impl X11 {
             .ok()?;
         let value = reply.value32()?.next();
         value.filter(|p| *p != 0)
+    }
+
+    fn owned_popup_is_focused(&self, target: Window, active: Window, keyboard: bool) -> bool {
+        if active == 0 || active == target {
+            return false;
+        }
+        let Some(attributes) = self
+            .conn
+            .get_window_attributes(target)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        else {
+            return false;
+        };
+        let transient_for = self
+            .conn
+            .get_property(false, target, self.wm_transient_for, AtomEnum::WINDOW, 0, 1)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32()?.next());
+        owned_popup(
+            attributes.override_redirect,
+            transient_for,
+            target,
+            active,
+            self.resource_id_mask,
+            self.owning_pid(target),
+            self.owning_pid(active),
+        ) && (self.focus_is_within(target) || (!keyboard && self.focus_is_within(active)))
+            && self.active_window() == Some(active)
     }
 
     /// Current server time via the PropertyNotify round-trip. `_NET_ACTIVE_WINDOW`
@@ -617,20 +668,22 @@ struct ConfirmOutcome {
     focus_holder: Option<String>,
 }
 
-fn confirm_phase(target: Window, settle: Duration) -> Result<ConfirmOutcome> {
+fn confirm_phase(target: Window, settle: Duration, keyboard: bool) -> Result<ConfirmOutcome> {
     let x = X11::open()?;
     let start = Instant::now();
     let prior = x.active_window().unwrap_or(0);
     let mut retried = false;
     // Already active and focused: leave the window (and any open menu / grab)
     // untouched — re-activating is what popped GTK menus back down.
-    if prior == target && x.focus_is_within(target) {
+    if (prior == target && x.focus_is_within(target))
+        || x.owned_popup_is_focused(target, prior, keyboard)
+    {
         return Ok(ConfirmOutcome {
             confirmed: true,
             already_active: true,
             retried: false,
             elapsed: start.elapsed(),
-            active_after: target,
+            active_after: prior,
             focus_within: true,
             focus_holder: None,
         });
@@ -743,13 +796,15 @@ pub fn with_x11_foreground_opts<T>(
 ) -> Result<(T, ForegroundReport)> {
     let target = xid as Window;
     let phase_budget = opts.settle + Duration::from_millis(1500);
-    let outcome = run_with_deadline(phase_budget, move || confirm_phase(target, opts.settle))
-        .ok_or_else(|| {
-            anyhow!(
-                "{CODE_TIMEOUT}: the X server did not answer the activation of window \
+    let outcome = run_with_deadline(phase_budget, move || {
+        confirm_phase(target, opts.settle, opts.keyboard)
+    })
+    .ok_or_else(|| {
+        anyhow!(
+            "{CODE_TIMEOUT}: the X server did not answer the activation of window \
                  0x{xid:x} within {phase_budget:?}; no input was sent"
-            )
-        })??;
+        )
+    })??;
     if !outcome.confirmed {
         let holder = outcome.focus_holder.as_deref().unwrap_or("unknown");
         let cause = if outcome.active_after == 0 {
@@ -828,6 +883,62 @@ fn describe_focus_holder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_foreground_requires_a_positive_active_owner() {
+        let owner = 0x0160_0003;
+        let popup = 0x0160_01d8;
+        let foreign = 0x0240_0003;
+        let mask = 0x001f_ffff;
+        assert!(owned_popup(true, None, popup, owner, mask, None, None));
+        assert!(owned_popup(
+            true,
+            None,
+            foreign,
+            owner,
+            mask,
+            Some(42),
+            Some(42)
+        ));
+        assert!(owned_popup(
+            false,
+            Some(owner),
+            foreign,
+            owner,
+            mask,
+            None,
+            None
+        ));
+        assert!(!owned_popup(true, None, foreign, owner, mask, None, None));
+        assert!(!owned_popup(
+            true,
+            None,
+            foreign,
+            owner,
+            mask,
+            Some(43),
+            Some(42)
+        ));
+        assert!(!owned_popup(
+            false,
+            None,
+            popup,
+            owner,
+            mask,
+            Some(42),
+            Some(42)
+        ));
+        assert!(!owned_popup(true, None, popup, 0, mask, Some(42), Some(42)));
+        assert!(!owned_popup(
+            true,
+            None,
+            owner,
+            owner,
+            mask,
+            Some(42),
+            Some(42)
+        ));
+    }
 
     #[test]
     fn focus_holder_names_the_owner() {
