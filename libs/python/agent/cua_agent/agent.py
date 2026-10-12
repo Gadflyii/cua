@@ -51,7 +51,7 @@ from .responses import (
     replace_failed_computer_calls_with_function_calls,
 )
 from .tools.base import BaseComputerTool, BaseTool
-from .types import AgentCapability, IllegalArgumentError, Messages, ToolError
+from .types import AgentCapability, AgentConfigInfo, IllegalArgumentError, Messages, ToolError
 
 
 def assert_callable_with(f, *args, **kwargs):
@@ -371,7 +371,9 @@ class ComputerAgent:
         # Find the appropriate agent loop
         if custom_loop:
             self.agent_loop = custom_loop
-            self.agent_config_info = None
+            self.agent_config_info = AgentConfigInfo(
+                agent_class=type(custom_loop), models_regex=".*"
+            )
         else:
             config_info = find_agent_config(model)
             if not config_info:
@@ -847,6 +849,8 @@ class ComputerAgent:
                 if isinstance(function, BaseTool):
                     # BaseTool.call() handles its own execution
                     result = function.call(args)
+                    if inspect.isawaitable(result):
+                        result = await result
                 else:
                     # Validate arguments before execution for regular callables
                     assert_callable_with(function, **args)
